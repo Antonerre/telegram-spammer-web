@@ -1,0 +1,112 @@
+# dnevnik_marks.py
+import asyncio
+from pydnevnikruapi import AsyncDiaryAPI
+from datetime import datetime
+
+# --- Замените на свои данные ---
+LOGIN = "ваш_логин"      # e-mail или логин от дневник.ру
+PASSWORD = "ваш_пароль"
+# --------------------------------
+
+async def main():
+    async with AsyncDiaryAPI(login=LOGIN, password=PASSWORD) as dn:
+        # Устанавливаем токен (в библиотеке это делает set_token внутри контекстного менеджера)
+        await dn.set_token()
+
+        # Получим информацию о пользователе и о доступных учебных группах (классы/ученики)
+        user_info = await dn.get_info()            # /users/me
+        print("Пользователь:", user_info.get("fullName") or user_info.get("login"))
+        
+        edu_groups = await dn.get_edu_groups()     # Список групп/классов (id и т.п.)
+        if not edu_groups:
+            print("Не найдено ни одной учебной группы.")
+            return
+
+        # Обычно нужно выбрать группу (если у вас несколько — возьмём первую)
+        group = edu_groups[0]
+        group_id = group.get("id") or group.get("eduGroupId") or group.get("eduGroup", {}).get("id")
+        print("Выбрана группа id:", group_id, "название:", group.get("name", "<no name>"))
+
+        # Получим список предметов в группе (через context или get_group_info)
+        group_info = await dn.get_group_info(group_id)
+        # В структуре будут предметы; названия могут быть в разных полях
+        subjects = group_info.get("subjects") or group_info.get("eduGroupSubjects") or []
+        if not subjects:
+            print("Не удалось получить список предметов из group_info. Попробуем контекст...")
+            ctx = await dn.get_context()
+            subjects = ctx.get("subjects", [])
+
+        print(f"Найдено предметов: {len(subjects)}")
+
+        # Для каждого предмета получаем оценки ученика (ваши оценки) за текущий отчётный период.
+        # Для этого нужно знать ваш person_id (id персоны ученика). Он обычно есть в user_info или в get_context.
+        context = await dn.get_context()
+        # попробуем взять person id (если вы — родитель, может быть список детей)
+        person_id = None
+        if "activePersonId" in context:
+            person_id = context["activePersonId"]
+        elif "personId" in user_info:
+            person_id = user_info["personId"]
+        else:
+            # Если нет — возьмём первого ученика из children / user children
+            children = await dn.get_user_children(user_info.get("id"))
+            if children:
+                person_id = children[0].get("id")
+
+        if not person_id:
+            print("Не удалось определить person_id (id ученика).")
+            return
+
+        print("person_id =", person_id)
+
+        # Определим текущий отчетный период (например, четверть/семестр). В API есть reporting-periods.
+        periods = await dn.get_person_reporting_periods(person_id)
+        if not periods:
+            print("Не удалось получить reporting periods; попробуем взять оценки за диапазон дат.")
+            # как fallback — берем последние 120 дней
+            from_dt = (datetime.now() - timedelta(days=120)).isoformat()
+            to_dt = datetime.now().isoformat()
+            marks = await dn.get_person_marks(person_id, from_dt, to_dt)
+            print(marks)
+            return
+
+        # Выберем последний (текущий) период
+        period = periods[-1]
+        period_id = period.get("id") or period.get("reportingPeriodId")
+        print("Используем период:", period.get("name") or str(period_id))
+
+        # Для каждого предмета запросим оценки ученика за период:
+        for subj in subjects:
+            subj_id = subj.get("subject") or subj.get("id") or subj.get("subjectId")
+            subj_name = subj.get("name") or subj.get("subjectName") or subj.get("title") or f"id_{subj_id}"
+            if not subj_id:
+                continue
+
+            # Метод в библиотеке: get_person_average_marks / get_person_marks / get_person_marks_by_period
+            try:
+                # Ниже один из вариантов — точное имя метода зависит от версии библиотеки
+                marks = await dn.get_person_marks_by_period(group_id, person_id, subj_id, period_id)
+            except Exception:
+                # fallback: общий метод get_person_marks(person_id, from, to)
+                from_dt = period.get("startDate") or None
+                to_dt = period.get("endDate") or None
+                if from_dt and to_dt:
+                    marks = await dn.get_person_marks(person_id, from_dt, to_dt)
+                else:
+                    marks = []
+
+            # marks — структура с оценками; печатаем в удобном виде
+            print("\n===", subj_name, "===")
+            if not marks:
+                print("Оценок нет или не удалось получить.")
+                continue
+
+            # Пробежимся и напечатаем дату/оценку/комментарий
+            for m in marks:
+                val = m.get("mark") or m.get("value") or m.get("valueType") or str(m)
+                date = m.get("date") or m.get("lessonDate") or m.get("createdAt")
+                comment = m.get("comment") or m.get("note") or ""
+                print(f"{date} — {val} {('- ' + comment) if comment else ''}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
