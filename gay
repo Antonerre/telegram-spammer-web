@@ -1,112 +1,217 @@
-# dnevnik_marks.py
-import asyncio
-from pydnevnikruapi import AsyncDiaryAPI
-from datetime import datetime
+# dnevnik_scrape.py
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
 
-# --- Замените на свои данные ---
-LOGIN = "ваш_логин"      # e-mail или логин от дневник.ру
-PASSWORD = "ваш_пароль"
-# --------------------------------
+# ---------- Вставьте свои данные ----------
+LOGIN = "your_login_or_email"
+PASSWORD = "your_password"
+# ------------------------------------------
 
-async def main():
-    async with AsyncDiaryAPI(login=LOGIN, password=PASSWORD) as dn:
-        # Устанавливаем токен (в библиотеке это делает set_token внутри контекстного менеджера)
-        await dn.set_token()
+def start_browser(headless=False):
+    chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    # Установка драйвера
+    driver = webdriver.Chrome(ChromeDriverManager().install(), options=chrome_options)
+    driver.maximize_window()
+    return driver
 
-        # Получим информацию о пользователе и о доступных учебных группах (классы/ученики)
-        user_info = await dn.get_info()            # /users/me
-        print("Пользователь:", user_info.get("fullName") or user_info.get("login"))
-        
-        edu_groups = await dn.get_edu_groups()     # Список групп/классов (id и т.п.)
-        if not edu_groups:
-            print("Не найдено ни одной учебной группы.")
-            return
+def login_dnevnik(driver, login, password):
+    # Открываем страницу логина (универсально)
+    driver.get("https://login.dnevnik.ru/")
+    time.sleep(1.0)
 
-        # Обычно нужно выбрать группу (если у вас несколько — возьмём первую)
-        group = edu_groups[0]
-        group_id = group.get("id") or group.get("eduGroupId") or group.get("eduGroup", {}).get("id")
-        print("Выбрана группа id:", group_id, "название:", group.get("name", "<no name>"))
+    # Попытаемся найти поля логина/пароля. Сайт может менять атрибуты — пробуем несколько вариантов.
+    # 1) По имени/идентификатору
+    try:
+        inp_login = driver.find_element(By.NAME, "login")
+    except:
+        try:
+            inp_login = driver.find_element(By.ID, "login")
+        except:
+            inp_login = None
 
-        # Получим список предметов в группе (через context или get_group_info)
-        group_info = await dn.get_group_info(group_id)
-        # В структуре будут предметы; названия могут быть в разных полях
-        subjects = group_info.get("subjects") or group_info.get("eduGroupSubjects") or []
-        if not subjects:
-            print("Не удалось получить список предметов из group_info. Попробуем контекст...")
-            ctx = await dn.get_context()
-            subjects = ctx.get("subjects", [])
+    if inp_login is None:
+        # Альтернатива: найдём поле ввода типа text на странице
+        inputs = driver.find_elements(By.TAG_NAME, "input")
+        inp_login = None
+        for i in inputs:
+            t = i.get_attribute("type") or ""
+            if t.lower() in ("text", "email"):
+                inp_login = i
+                break
 
-        print(f"Найдено предметов: {len(subjects)}")
+    if inp_login is None:
+        raise RuntimeError("Не удалось найти поле логина на странице. Возможно сайт изменил разметку.")
 
-        # Для каждого предмета получаем оценки ученика (ваши оценки) за текущий отчётный период.
-        # Для этого нужно знать ваш person_id (id персоны ученика). Он обычно есть в user_info или в get_context.
-        context = await dn.get_context()
-        # попробуем взять person id (если вы — родитель, может быть список детей)
-        person_id = None
-        if "activePersonId" in context:
-            person_id = context["activePersonId"]
-        elif "personId" in user_info:
-            person_id = user_info["personId"]
+    inp_login.clear()
+    inp_login.send_keys(login)
+    time.sleep(0.3)
+
+    # Аналогично поле пароля
+    try:
+        inp_pass = driver.find_element(By.NAME, "password")
+    except:
+        try:
+            inp_pass = driver.find_element(By.ID, "password")
+        except:
+            inp_pass = None
+
+    if inp_pass is None:
+        for i in inputs:
+            t = i.get_attribute("type") or ""
+            if t.lower() == "password":
+                inp_pass = i
+                break
+
+    if inp_pass is None:
+        raise RuntimeError("Не удалось найти поле пароля на странице.")
+
+    inp_pass.clear()
+    inp_pass.send_keys(password)
+    time.sleep(0.3)
+
+    # Отправляем форму — пробуем нажать Enter
+    inp_pass.send_keys(Keys.RETURN)
+    # Ждём редиректа/загрузки страницы профиля
+    time.sleep(3.5)
+
+    # Проверим, что авторизация прошла: на странице должны появиться элементы личного кабинета
+    if "login" in driver.current_url.lower() or "auth" in driver.current_url.lower():
+        # возможно, требуется ручное подтверждение, captcha или 2FA
+        raise RuntimeError("Вход не выполнен автоматически — возможно требуется 2FA / captcha / дополнительное подтверждение. Проверьте браузерное окно.")
+
+    return True
+
+def get_marks_html(driver):
+    # Перейдём на страницу дневника / журналов/оценок. Типичный URL — дневник (может отличаться):
+    # Попытаемся открыть основную страницу дневника
+    driver.get("https://dnevnik.ru/")
+    time.sleep(2.0)
+
+    # Иногда дневник размещает оценки прямо на главной странице после входа; в противном случае
+    # можно попробовать перейти в раздел "Дневник" или "Журнал".
+    # Попробуем найти ссылку с текстом "Дневник" / "Журнал" / "Оценки"
+    try:
+        #ищем элементы ссылок
+        anchors = driver.find_elements(By.TAG_NAME, "a")
+        target = None
+        for a in anchors:
+            t = a.text.strip().lower()
+            if "дневник" in t or "журнал" in t or "оценки" in t:
+                target = a
+                break
+        if target:
+            target.click()
+            time.sleep(2.0)
         else:
-            # Если нет — возьмём первого ученика из children / user children
-            children = await dn.get_user_children(user_info.get("id"))
-            if children:
-                person_id = children[0].get("id")
+            # если не нашли — оставим текущую страницу
+            pass
+    except Exception:
+        pass
 
-        if not person_id:
-            print("Не удалось определить person_id (id ученика).")
+    # Даем JS прогрузиться
+    time.sleep(2.0)
+    html = driver.page_source
+    return html
+
+def parse_marks(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Попытаемся найти все предметы и оценки.
+    # Подход: найти блоки, содержащие название предмета и рядом стоящие оценки.
+    results = {}
+
+    # Вариант 1: искать блоки с классом, содержащим "subject" или "lesson"
+    subject_blocks = soup.find_all(lambda tag:
+                                   tag.name in ("div", "section") and
+                                   (tag.get("class") and any("subject" in cl.lower() or "lesson" in cl.lower() for cl in tag.get("class"))))
+
+    # Если ничего не найдено — попробуем искать заголовки <h3>, <h4> которые выглядят как предметы
+    if not subject_blocks:
+        headers = soup.find_all(["h3", "h4", "h2"])
+        for h in headers:
+            text = h.get_text(strip=True)
+            if not text:
+                continue
+            # простая эвристика: если в тексте есть русские буквы и длина < 60 — вероятно это предмет
+            if any("а" <= ch <= "я" or "А" <= ch <= "Я" for ch in text) and len(text) < 60:
+                # найдем соседние элементы с цифрами (оценками)
+                sibling_text = ""
+                # смотрим несколько следующих sibling'ов на предмет оценок
+                for sib in h.find_next_siblings(limit=6):
+                    sibling_text += " " + sib.get_text(separator=" ", strip=True)
+                # ищем числа 2-5
+                marks = []
+                for token in sibling_text.split():
+                    if token.isdigit() and token in ("2","3","4","5"):
+                        marks.append(token)
+                if marks:
+                    results[text] = marks
+
+    # Если нашли subject_blocks — анализируем их на предметы и оценки
+    for blk in subject_blocks:
+        # попытка получить заголовок предмета внутри блока
+        title = None
+        for tagname in ("h3","h4","h2","b","strong"):
+            t = blk.find(tagname)
+            if t and t.get_text(strip=True):
+                title = t.get_text(strip=True)
+                break
+        if not title:
+            # возможно название в атрибуте
+            title = blk.get("data-subject") or blk.get("aria-label") or None
+        if not title:
+            # если нет — пропускаем
+            continue
+
+        # найти оценки в блоке: цифры 2..5 или буквы (З/н/нб и т.п.)
+        marks = []
+        # ищем элементы, где текст — короткая оценка
+        for el in blk.find_all(text=True):
+            txt = el.strip()
+            if not txt:
+                continue
+            # фильтруем короткие токены, содержащие цифры оценки
+            for token in txt.split():
+                if token in ("2","3","4","5"):
+                    marks.append(token)
+        if marks:
+            results[title] = marks
+
+    return results
+
+def main():
+    driver = start_browser(headless=False)  # headless=True если не хотите окно
+    try:
+        login_dnevnik(driver, LOGIN, PASSWORD)
+        print("Вход выполнен, получаем страницу дневника...")
+        html = get_marks_html(driver)
+        parsed = parse_marks(html)
+
+        if not parsed:
+            print("Не удалось найти оценки автоматически. Вывожу HTML-кусок для анализа (сокращённый):")
+            print(html[:3000])  # покажем начало страницы — можно по нему подстроить парсер
             return
 
-        print("person_id =", person_id)
+        print("\nНайденные предметы и оценки:")
+        for subj, marks in parsed.items():
+            print(f"- {subj}: {', '.join(marks)}")
 
-        # Определим текущий отчетный период (например, четверть/семестр). В API есть reporting-periods.
-        periods = await dn.get_person_reporting_periods(person_id)
-        if not periods:
-            print("Не удалось получить reporting periods; попробуем взять оценки за диапазон дат.")
-            # как fallback — берем последние 120 дней
-            from_dt = (datetime.now() - timedelta(days=120)).isoformat()
-            to_dt = datetime.now().isoformat()
-            marks = await dn.get_person_marks(person_id, from_dt, to_dt)
-            print(marks)
-            return
-
-        # Выберем последний (текущий) период
-        period = periods[-1]
-        period_id = period.get("id") or period.get("reportingPeriodId")
-        print("Используем период:", period.get("name") or str(period_id))
-
-        # Для каждого предмета запросим оценки ученика за период:
-        for subj in subjects:
-            subj_id = subj.get("subject") or subj.get("id") or subj.get("subjectId")
-            subj_name = subj.get("name") or subj.get("subjectName") or subj.get("title") or f"id_{subj_id}"
-            if not subj_id:
-                continue
-
-            # Метод в библиотеке: get_person_average_marks / get_person_marks / get_person_marks_by_period
-            try:
-                # Ниже один из вариантов — точное имя метода зависит от версии библиотеки
-                marks = await dn.get_person_marks_by_period(group_id, person_id, subj_id, period_id)
-            except Exception:
-                # fallback: общий метод get_person_marks(person_id, from, to)
-                from_dt = period.get("startDate") or None
-                to_dt = period.get("endDate") or None
-                if from_dt and to_dt:
-                    marks = await dn.get_person_marks(person_id, from_dt, to_dt)
-                else:
-                    marks = []
-
-            # marks — структура с оценками; печатаем в удобном виде
-            print("\n===", subj_name, "===")
-            if not marks:
-                print("Оценок нет или не удалось получить.")
-                continue
-
-            # Пробежимся и напечатаем дату/оценку/комментарий
-            for m in marks:
-                val = m.get("mark") or m.get("value") or m.get("valueType") or str(m)
-                date = m.get("date") or m.get("lessonDate") or m.get("createdAt")
-                comment = m.get("comment") or m.get("note") or ""
-                print(f"{date} — {val} {('- ' + comment) if comment else ''}")
+    except Exception as e:
+        print("Ошибка:", e)
+    finally:
+        # Закрываем браузер через 2 секунды, чтобы успели увидеть результат
+        time.sleep(2)
+        driver.quit()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
